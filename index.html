@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SNMP Traffic Monitor</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
 :root{--bg:#f4f6f8;--card:#fff;--text:#1d2329;--muted:#6b7680;--line:#e3e7eb;--hover:#eef3fb;
   --in:#2f80ed;--out:#f2994a;--up:#27ae60;--down:#eb5757;--stale:#9aa5b1}
@@ -161,15 +162,53 @@ function render(d) {
   chart.update();
 }
 
-async function refresh() {
-  try {
-    const r = await fetch("/api/data", {cache: "no-store"});
-    render(await r.json());
-  } catch (e) {
-    document.getElementById("dot").className = "dot bad";
-    document.getElementById("liveText").textContent = "เชื่อมต่อ dashboard ไม่ได้";
-  }
+const state = {latest: {}, history: {}};
+const MAXH = 90;
+const keyOf = r => r.router + "|" + r.ifname;
+
+function view() {
+  const now = Date.now();
+  const latest = Object.values(state.latest).map(r =>
+    Object.assign({}, r, {age: r.age0 + (now - r.rx) / 1000}));
+  return {latest: latest, history: state.history};
 }
+
+let pending = null;
+function scheduleRender() {
+  if (pending) return;
+  pending = setTimeout(() => { pending = null; render(view()); }, 200);
+}
+
+const socket = io({transports: ["websocket", "polling"]});
+
+socket.on("connect", () => {
+  document.getElementById("liveText").textContent = "เชื่อมต่อ Socket.IO แล้ว รอข้อมูล…";
+  socket.emit("snapshot_request");
+});
+socket.on("disconnect", () => {
+  document.getElementById("dot").className = "dot bad";
+  document.getElementById("liveText").textContent = "หลุดจาก Socket.IO กำลังเชื่อมต่อใหม่…";
+});
+socket.on("snapshot", d => {
+  const now = Date.now();
+  state.latest = {};
+  d.latest.forEach(r => {
+    state.latest[keyOf(r)] = Object.assign(r, {age0: r.age == null ? 9999 : r.age, rx: now});
+  });
+  state.history = d.history;
+  render(view());
+});
+socket.on("traffic", r => {
+  const k = keyOf(r);
+  state.latest[k] = Object.assign(r, {age0: r.age == null ? 0 : r.age, rx: Date.now()});
+  if (r.in_bps != null) {
+    const h = state.history[k] || (state.history[k] = []);
+    h.push([r.time, r.in_bps, r.out_bps]);
+    if (h.length > MAXH) h.shift();
+  }
+  scheduleRender();
+});
+setInterval(() => { if (socket.connected) render(view()); }, 5000);
 
 document.getElementById("routers").addEventListener("click", e => {
   const tr = e.target.closest("tr.row");
@@ -182,8 +221,6 @@ document.getElementById("virt").addEventListener("change", e => {
   if (lastData) render(lastData);
 });
 
-refresh();
-setInterval(refresh, 2000);
 </script>
 </body>
 </html>

@@ -1,24 +1,49 @@
-import json, os, threading, time
+import json, logging, os, threading, time
 from collections import defaultdict, deque
 from datetime import datetime
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+import socketio
 from confluent_kafka import Consumer
+from werkzeug.serving import run_simple
 
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.getenv("TOPIC", "snmp-traffic")
 PORT = int(os.getenv("PORT", "8000"))
 HISTORY = int(os.getenv("HISTORY", "90"))   # 90 จุด x 10 วินาที = 15 นาที
 
+sio = socketio.Server(async_mode="threading", cors_allowed_origins="*")
 latest = {}
 history = defaultdict(lambda: deque(maxlen=HISTORY))
 lock = threading.Lock()
+
+
+def age_of(ts):
+    try:
+        return round(time.time() - datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp())
+    except ValueError:
+        return None
+
+
+def with_age(d):
+    return dict(d, age=age_of(d["time"]))
+
+
+def snapshot():
+    with lock:
+        return {"latest": [with_age(v) for v in latest.values()],
+                "history": {k: list(v) for k, v in history.items()}}
+
+
+@sio.on("snapshot_request")
+def on_snapshot_request(sid):
+    sio.emit("snapshot", snapshot(), to=sid)
 
 
 def consume():
     c = Consumer({
         "bootstrap.servers": BOOTSTRAP,
         "group.id": "snmp-dashboard",
-        "auto.offset.reset": "earliest",   # เปิดมาแล้วมีข้อมูลย้อนหลังให้เห็นทันที
+        "auto.offset.reset": "earliest",
         "enable.auto.commit": False,
     })
     c.subscribe([TOPIC])
@@ -36,14 +61,10 @@ def consume():
             latest[key] = d
             if d.get("in_bps") is not None:
                 history[key].append([d["time"], d["in_bps"], d["out_bps"]])
-
-
-def age_of(ts):
-    try:
-        return round(time.time() - datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp())
-    except ValueError:
-        return None
-
+        row = with_age(d)
+        # ส่งเฉพาะข้อมูลสด (ตอนอ่านย้อนหลังจาก Kafka ตอนเริ่มระบบจะไม่ส่งให้ client)
+        if row["age"] is not None and row["age"] < 60:
+            sio.emit("traffic", row)
 
 
 def build_metrics():
@@ -66,36 +87,28 @@ def build_metrics():
             out.append("%s{%s} %s" % (name, lab(r), fn(r, age_of(r["time"]))))
     return ("\n".join(out) + "\n").encode()
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        path = self.path.split("?")[0]
-        if path == "/api/data":
-            with lock:
-                rows = [dict(v, age=age_of(v["time"])) for v in latest.values()]
-                body = json.dumps({"latest": rows,
-                                   "history": {k: list(v) for k, v in history.items()}})
-            self._send(200, body.encode(), "application/json")
-        elif path == "/metrics":
-            self._send(200, build_metrics(), "text/plain; version=0.0.4")
-        elif path in ("/", "/index.html"):
-            with open("index.html", "rb") as f:
-                self._send(200, f.read(), "text/html; charset=utf-8")
-        else:
-            self._send(404, b"not found", "text/plain")
 
-    def _send(self, code, body, ctype):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+def http_app(environ, start_response):
+    path = environ.get("PATH_INFO", "/")
+    if path == "/metrics":
+        body, ctype = build_metrics(), "text/plain; version=0.0.4"
+    elif path == "/api/data":
+        body, ctype = json.dumps(snapshot()).encode(), "application/json"
+    elif path in ("/", "/index.html"):
+        with open("index.html", "rb") as f:
+            body, ctype = f.read(), "text/html; charset=utf-8"
+    else:
+        start_response("404 Not Found", [("Content-Type", "text/plain")])
+        return [b"not found"]
+    start_response("200 OK", [("Content-Type", ctype), ("Cache-Control", "no-store"),
+                              ("Content-Length", str(len(body)))])
+    return [body]
 
-    def log_message(self, *args):
-        pass
 
+application = socketio.WSGIApp(sio, http_app)
 
 if __name__ == "__main__":
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
     threading.Thread(target=consume, daemon=True).start()
-    print(f"Dashboard on http://0.0.0.0:{PORT}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    print(f"Dashboard (Socket.IO) on http://0.0.0.0:{PORT}", flush=True)
+    run_simple("0.0.0.0", PORT, application, threaded=True)
