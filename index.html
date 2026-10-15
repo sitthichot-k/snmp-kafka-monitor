@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SNMP Traffic Monitor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--text:#1d2329;--muted:#6b7680;--line:#e3e7eb;--hover:#eef3fb;
+  --in:#2f80ed;--out:#f2994a;--up:#27ae60;--down:#eb5757;--stale:#9aa5b1}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1419;--card:#1a2129;--text:#e6edf3;--muted:#8b98a5;--line:#2a333d;--hover:#212b36}}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:18px;margin:0}
+h2{font-size:16px;margin:0}
+.muted{color:var(--muted)}
+.tools{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.live{display:flex;align-items:center;gap:8px;color:var(--muted)}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--stale)}
+.dot.ok{background:var(--up);box-shadow:0 0 0 4px rgba(39,174,96,.2)}
+.dot.bad{background:var(--down)}
+label{display:flex;gap:6px;align-items:center;cursor:pointer;color:var(--muted)}
+main{padding:20px 16px;max-width:1300px;margin:0 auto;display:grid;gap:16px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.kpi,.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.kpi .v{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:2px}
+.kpi .l{color:var(--muted);font-size:12px}
+.card-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;gap:8px}
+.routers{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,440px),1fr));gap:16px}
+.tbl{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:8px 6px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:500;font-size:12px}
+td.num,th.num{text-align:right}
+tr.row{cursor:pointer}
+tr.row:hover{background:var(--hover)}
+tr.sel td{background:var(--hover)}
+tr.sel td:first-child{box-shadow:inset 3px 0 0 var(--in)}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;color:#fff;background:var(--stale)}
+.pill.up{background:var(--up)}.pill.down{background:var(--down)}
+.bar{height:5px;background:var(--line);border-radius:3px;overflow:hidden;margin:2px 0;min-width:60px}
+.bar span{display:block;height:100%;transition:width .4s}
+.bin{background:var(--in)}.bout{background:var(--out)}
+.chart-wrap{height:320px;position:relative}
+.legend{display:flex;gap:14px;font-size:12px;color:var(--muted)}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.empty{padding:40px;text-align:center;color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <h1>SNMP Traffic Monitor</h1>
+  <div class="tools">
+    <label><input type="checkbox" id="virt"> แสดง Vo0 / Nu0 / Lo0</label>
+    <div class="live"><span class="dot" id="dot"></span><span id="liveText">กำลังเชื่อมต่อ…</span></div>
+  </div>
+</header>
+<main>
+  <section class="kpis">
+    <div class="kpi"><div class="l">Routers</div><div class="v" id="kRouters">–</div></div>
+    <div class="kpi"><div class="l">Interfaces up / ทั้งหมด</div><div class="v" id="kUp">–</div></div>
+    <div class="kpi"><div class="l">ลิงก์ที่ traffic สูงสุดตอนนี้</div><div class="v" id="kTop">–</div></div>
+    <div class="kpi"><div class="l">อัปเดตล่าสุด</div><div class="v" id="kTime">–</div></div>
+  </section>
+  <section class="card">
+    <div class="card-h">
+      <h2 id="chartTitle">เลือก interface จากตารางด้านล่าง</h2>
+      <div class="legend"><span><i style="background:var(--in)"></i>In</span><span><i style="background:var(--out)"></i>Out</span></div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart"></canvas></div>
+  </section>
+  <section class="routers" id="routers"><div class="empty card">รอข้อมูลจาก Kafka… (รอบแรกใช้เวลาประมาณ 20 วินาที)</div></section>
+</main>
+<script>
+const VIRTUAL = /^(Vo|Nu|Lo)/;
+const store = {get(k){try{return localStorage.getItem(k)}catch(e){return null}},
+               set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+let showVirtual = store.get("virt") === "1";
+let selected = store.get("sel") || "R1|Fa1/0";
+let lastData = null;
+document.getElementById("virt").checked = showVirtual;
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = b => b == null ? "–" : b >= 1e6 ? (b/1e6).toFixed(2)+" Mbps" : b >= 1e3 ? (b/1e3).toFixed(1)+" kbps" : b+" bps";
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+const chart = new Chart(document.getElementById("chart"), {
+  type: "line",
+  data: {labels: [], datasets: [
+    {label: "In",  data: [], borderColor: "#2f80ed", backgroundColor: "rgba(47,128,237,.15)", fill: true, tension: .3, pointRadius: 0, borderWidth: 2},
+    {label: "Out", data: [], borderColor: "#f2994a", backgroundColor: "rgba(242,153,74,.15)", fill: true, tension: .3, pointRadius: 0, borderWidth: 2}
+  ]},
+  options: {
+    animation: false, responsive: true, maintainAspectRatio: false,
+    interaction: {mode: "index", intersect: false},
+    plugins: {legend: {display: false},
+      tooltip: {callbacks: {label: c => `${c.dataset.label}: ${c.parsed.y.toFixed(2)} Mbps`}}},
+    scales: {
+      x: {ticks: {color: css("--muted"), maxTicksLimit: 8}, grid: {color: css("--line")}},
+      y: {beginAtZero: true, ticks: {color: css("--muted"), callback: v => v + " Mbps"}, grid: {color: css("--line")}}
+    }
+  }
+});
+function render(d) {
+  lastData = d;
+  const all = d.latest;
+  const rows = all.filter(x => showVirtual || !VIRTUAL.test(x.ifname));
+  if (!all.length) return;
+
+  const routers = [...new Set(all.map(x => x.router))].sort();
+  const phys = all.filter(x => !VIRTUAL.test(x.ifname));
+  const upCount = phys.filter(x => x.status === "up" && x.age < 30).length;
+  document.getElementById("kRouters").textContent = routers.length;
+  document.getElementById("kUp").textContent = `${upCount} / ${phys.length}`;
+
+  let top = null;
+  rows.forEach(x => { const v = Math.max(x.in_bps||0, x.out_bps||0); if (!top || v > top.v) top = {v, x}; });
+  document.getElementById("kTop").textContent = top && top.v > 0 ? `${top.x.router} ${top.x.ifname} · ${fmt(top.v)}` : "ไม่มี traffic";
+
+  const newest = all.reduce((a, x) => x.time > a.time ? x : a);
+  document.getElementById("kTime").textContent = newest.time.slice(11);
+  const fresh = newest.age != null && newest.age < 30;
+  document.getElementById("dot").className = "dot " + (fresh ? "ok" : "bad");
+  document.getElementById("liveText").textContent = fresh ? "Live" : `ไม่มีข้อมูลใหม่ ${newest.age}s (เช็ก poller)`;
+
+  const maxBps = Math.max(1e6, ...rows.map(x => Math.max(x.in_bps||0, x.out_bps||0)));
+  const pct = v => Math.min(100, (v||0) / maxBps * 100).toFixed(1);
+
+  if (!d.history[selected]) {
+    const first = rows.find(x => d.history[`${x.router}|${x.ifname}`]);
+    if (first) selected = `${first.router}|${first.ifname}`;
+  }
+
+  document.getElementById("routers").innerHTML = routers.map(rt => {
+    const list = rows.filter(x => x.router === rt).sort((a, b) => a.ifindex - b.ifindex);
+    const ip = (all.find(x => x.router === rt) || {}).ip || "";
+    return `<section class="card">
+      <div class="card-h"><h2>${esc(rt)}</h2><span class="muted">${esc(ip)}</span></div>
+      <div class="tbl"><table>
+        <thead><tr><th>Interface</th><th>Status</th><th class="num">In</th><th class="num">Out</th><th>Load</th></tr></thead>
+        <tbody>${list.map(x => {
+          const k = `${x.router}|${x.ifname}`;
+          const st = x.age > 30 ? "stale" : x.status;
+          return `<tr class="row${k === selected ? " sel" : ""}" data-key="${esc(k)}">
+            <td>${esc(x.ifname)}</td>
+            <td><span class="pill ${esc(st)}">${esc(st)}</span></td>
+            <td class="num">${fmt(x.in_bps)}</td>
+            <td class="num">${fmt(x.out_bps)}</td>
+            <td><div class="bar"><span class="bin" style="width:${pct(x.in_bps)}%"></span></div>
+                <div class="bar"><span class="bout" style="width:${pct(x.out_bps)}%"></span></div></td>
+          </tr>`;}).join("")}</tbody>
+      </table></div></section>`;
+  }).join("");
+
+  const h = d.history[selected] || [];
+  document.getElementById("chartTitle").textContent = selected.replace("|", " · ") + " (ย้อนหลัง ~15 นาที)";
+  chart.data.labels = h.map(p => p[0].slice(11));
+  chart.data.datasets[0].data = h.map(p => p[1] / 1e6);
+  chart.data.datasets[1].data = h.map(p => p[2] / 1e6);
+  chart.update();
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/data", {cache: "no-store"});
+    render(await r.json());
+  } catch (e) {
+    document.getElementById("dot").className = "dot bad";
+    document.getElementById("liveText").textContent = "เชื่อมต่อ dashboard ไม่ได้";
+  }
+}
+
+document.getElementById("routers").addEventListener("click", e => {
+  const tr = e.target.closest("tr.row");
+  if (!tr) return;
+  selected = tr.dataset.key; store.set("sel", selected);
+  if (lastData) render(lastData);
+});
+document.getElementById("virt").addEventListener("change", e => {
+  showVirtual = e.target.checked; store.set("virt", showVirtual ? "1" : "0");
+  if (lastData) render(lastData);
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -1,0 +1,119 @@
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: snmp-kafka
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_HEAP_OPTS: "-Xmx384m -Xms384m"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    mem_limit: 768m
+    restart: unless-stopped
+
+  poller:
+    build: .
+    container_name: snmp-poller
+    command: python -u poller.py
+    environment:
+      ROUTERS: "R1=192.168.199.143,R2=192.168.199.144"
+      COMMUNITY: "public"
+      INTERVAL: "10"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      TOPIC: "snmp-traffic"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    mem_limit: 128m
+    restart: unless-stopped
+
+  consumer:
+    build: .
+    container_name: snmp-consumer
+    command: python -u consumer.py
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      TOPIC: "snmp-traffic"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    mem_limit: 128m
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    container_name: snmp-dashboard
+    command: python -u dashboard.py
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP: "kafka:9092"
+      TOPIC: "snmp-traffic"
+      PORT: "8000"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    mem_limit: 128m
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: snmp-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+      - --storage.tsdb.path=/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    mem_limit: 256m
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: snmp-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    mem_limit: 256m
+    restart: unless-stopped
+
+volumes:
+  prom-data:
+  grafana-data:

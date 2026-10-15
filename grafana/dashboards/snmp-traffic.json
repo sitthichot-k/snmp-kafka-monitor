@@ -1,0 +1,40 @@
+{
+ "title": "SNMP Traffic",
+ "uid": "snmp-traffic",
+ "refresh": "15s",
+ "schemaVersion": 39,
+ "time": {"from": "now-15m", "to": "now"},
+ "templating": {"list": [
+  {"name": "router", "type": "query", "label": "Router",
+   "datasource": {"type": "prometheus", "uid": "prom"},
+   "query": "label_values(snmp_if_in_octets_total, router)", "refresh": 2,
+   "includeAll": true, "multi": true,
+   "current": {"text": "All", "value": "$__all"}}
+ ]},
+ "panels": [
+  {"id": 1, "type": "timeseries", "title": "Traffic In",
+   "gridPos": {"x": 0, "y": 0, "w": 12, "h": 9},
+   "datasource": {"type": "prometheus", "uid": "prom"},
+   "fieldConfig": {"defaults": {"unit": "bps"}, "overrides": []},
+   "targets": [{"refId": "A", "legendFormat": "{{router}} {{ifname}}",
+    "expr": "rate(snmp_if_in_octets_total{router=~\"$router\",ifname!~\"Vo.*|Nu.*|Lo.*\"}[1m])*8"}]},
+  {"id": 2, "type": "timeseries", "title": "Traffic Out",
+   "gridPos": {"x": 12, "y": 0, "w": 12, "h": 9},
+   "datasource": {"type": "prometheus", "uid": "prom"},
+   "fieldConfig": {"defaults": {"unit": "bps"}, "overrides": []},
+   "targets": [{"refId": "A", "legendFormat": "{{router}} {{ifname}}",
+    "expr": "rate(snmp_if_out_octets_total{router=~\"$router\",ifname!~\"Vo.*|Nu.*|Lo.*\"}[1m])*8"}]},
+  {"id": 3, "type": "stat", "title": "Interfaces up",
+   "gridPos": {"x": 0, "y": 9, "w": 12, "h": 5},
+   "datasource": {"type": "prometheus", "uid": "prom"},
+   "targets": [{"refId": "A", "legendFormat": "{{router}}",
+    "expr": "count by (router) (snmp_if_up{router=~\"$router\",ifname!~\"Vo.*|Nu.*|Lo.*\"}==1)"}]},
+  {"id": 4, "type": "stat", "title": "Data age (วินาที, ควร < 30)",
+   "gridPos": {"x": 12, "y": 9, "w": 12, "h": 5},
+   "datasource": {"type": "prometheus", "uid": "prom"},
+   "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"mode": "absolute",
+    "steps": [{"color": "green", "value": null}, {"color": "red", "value": 30}]}}, "overrides": []},
+   "targets": [{"refId": "A", "legendFormat": "{{router}}",
+    "expr": "max by (router) (snmp_sample_age_seconds{router=~\"$router\"})"}]}
+ ]
+}
